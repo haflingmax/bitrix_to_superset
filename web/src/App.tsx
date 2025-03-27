@@ -22,7 +22,7 @@ interface SyncStatus {
   progress: number;
   total: number;
   last_run: string | null;
-  stop_requested: boolean; // Добавляем новое поле
+  stop_requested: boolean;
 }
 
 const App: React.FC = () => {
@@ -141,6 +141,10 @@ const App: React.FC = () => {
     }
   };
 
+  const getProgressPercentage = (progress: number, total: number) => {
+    return total > 0 ? Math.min((progress / total) * 100, 100) : 0;
+  };
+
   return (
     <div className={`flex flex-col min-h-screen ${isDarkMode ? "dark bg-gray-900" : "bg-gray-100"}`}>
       <header className="bg-white dark:bg-gray-800 shadow-md p-4 flex justify-between items-center">
@@ -184,54 +188,71 @@ const App: React.FC = () => {
             {syncTables.map((table) => (
               <div
                 key={table.name}
-                className="flex items-center justify-between py-3 border-b last:border-b-0 border-gray-200 dark:border-gray-700"
+                className="flex flex-col py-3 border-b last:border-b-0 border-gray-200 dark:border-gray-700"
               >
-                <div>
-                  <p className="text-gray-800 dark:text-gray-100 font-medium">{table.name}</p>
-                  <p className="text-sm text-gray-600 dark:text-gray-400">{table.method}</p>
-                  {syncCounts[table.entity] && (
-                    <p className="text-sm text-gray-600 dark:text-gray-400">
-                      Bitrix: {syncCounts[table.entity].bitrix}, DB: {syncCounts[table.entity].db}
-                    </p>
-                  )}
-                  {syncStatus[table.entity]?.running && (
-                    <p className="text-sm text-blue-500">
-                      Синхронизация: {syncStatus[table.entity].progress} / {syncStatus[table.entity].total}
-                    </p>
-                  )}
-                </div>
-                <div className="flex gap-2">
-                  <button
-                    onClick={() => handleSync(table.entity)}
-                    disabled={syncStatus[table.entity]?.running}
-                    className={`flex items-center px-3 py-1 rounded-lg shadow transition-colors ${
-                      syncStatus[table.entity]?.running
-                        ? "bg-gray-400 text-gray-700 cursor-not-allowed"
-                        : "bg-green-500 text-white hover:bg-green-600"
-                    }`}
-                  >
-                    <SyncIcon className="w-4 h-4 mr-2" /> Синхронизировать
-                  </button>
-                  {syncStatus[table.entity]?.running && (
+                <div className="flex items-center justify-between">
+                  <div>
+                    <p className="text-gray-800 dark:text-gray-100 font-medium">{table.name}</p>
+                    <p className="text-sm text-gray-600 dark:text-gray-400">{table.method}</p>
+                    {syncCounts[table.entity] && (
+                      <p className="text-sm text-gray-600 dark:text-gray-400">
+                        Bitrix: {syncCounts[table.entity].bitrix}, DB: {syncCounts[table.entity].db}
+                      </p>
+                    )}
+                    {syncStatus[table.entity]?.running && (
+                      <p className="text-sm text-blue-500">
+                        Синхронизация: {syncStatus[table.entity].progress} / {syncStatus[table.entity].total}
+                      </p>
+                    )}
+                  </div>
+                  <div className="flex gap-2">
                     <button
-                      onClick={() => handleStopSync(table.entity)}
-                      className="flex items-center px-3 py-1 rounded-lg shadow bg-orange-500 text-white hover:bg-orange-600 transition-colors"
+                      onClick={() => handleSync(table.entity)}
+                      disabled={syncStatus[table.entity]?.running}
+                      className={`flex items-center px-3 py-1 rounded-lg shadow transition-colors ${
+                        syncStatus[table.entity]?.running
+                          ? "bg-gray-400 text-gray-700 cursor-not-allowed"
+                          : "bg-green-500 text-white hover:bg-green-600"
+                      }`}
                     >
-                      <StopIcon className="w-4 h-4 mr-2" /> Остановить
+                      <SyncIcon className="w-4 h-4 mr-2" /> Синхронизировать
                     </button>
-                  )}
-                  <button
-                    onClick={() => handleClear(table.entity)}
-                    disabled={syncStatus[table.entity]?.running}
-                    className={`flex items-center px-3 py-1 rounded-lg shadow transition-colors ${
-                      syncStatus[table.entity]?.running
-                        ? "bg-gray-400 text-gray-700 cursor-not-allowed"
-                        : "bg-red-500 text-white hover:bg-red-600"
-                    }`}
-                  >
-                    <TrashIcon className="w-4 h-4 mr-2" /> Очистить
-                  </button>
+                    {syncStatus[table.entity]?.running && (
+                      <button
+                        onClick={() => handleStopSync(table.entity)}
+                        className="flex items-center px-3 py-1 rounded-lg shadow bg-orange-500 text-white hover:bg-orange-600 transition-colors"
+                      >
+                        <StopIcon className="w-4 h-4 mr-2" /> Остановить
+                      </button>
+                    )}
+                    <button
+                      onClick={() => handleClear(table.entity)}
+                      disabled={syncStatus[table.entity]?.running}
+                      className={`flex items-center px-3 py-1 rounded-lg shadow transition-colors ${
+                        syncStatus[table.entity]?.running
+                          ? "bg-gray-400 text-gray-700 cursor-not-allowed"
+                          : "bg-red-500 text-white hover:bg-red-600"
+                      }`}
+                    >
+                      <TrashIcon className="w-4 h-4 mr-2" /> Очистить
+                    </button>
+                  </div>
                 </div>
+                {syncStatus[table.entity]?.running && (
+                  <div className="mt-2">
+                    <div className="w-full bg-gray-200 dark:bg-gray-700 rounded-full h-2.5">
+                      <div
+                        className="bg-blue-500 h-2.5 rounded-full transition-all duration-500"
+                        style={{
+                          width: `${getProgressPercentage(
+                            syncStatus[table.entity].progress,
+                            syncStatus[table.entity].total
+                          )}%`,
+                        }}
+                      ></div>
+                    </div>
+                  </div>
+                )}
               </div>
             ))}
           </div>
