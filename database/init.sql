@@ -1,0 +1,125 @@
+-- Удаляем таблицу, если она существует, чтобы гарантировать чистую инициализацию
+DROP TABLE IF EXISTS deals;
+DROP TABLE IF EXISTS tasks;
+DROP TABLE IF EXISTS projects;
+
+CREATE TABLE IF NOT EXISTS deals (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    amount NUMERIC(15, 2),
+    status TEXT,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE tasks (
+    id INTEGER PRIMARY KEY,
+    parent_id INTEGER,
+    title TEXT NOT NULL,
+    description TEXT,
+    mark TEXT,
+    priority INTEGER NOT NULL DEFAULT 1, 
+    multitask BOOLEAN NOT NULL DEFAULT FALSE,
+    not_viewed BOOLEAN NOT NULL DEFAULT FALSE,
+    replicate BOOLEAN NOT NULL DEFAULT FALSE,
+    stage_id INTEGER NOT NULL DEFAULT 0,
+    created_by INTEGER NOT NULL DEFAULT 0,
+    created_date TIMESTAMP WITH TIME ZONE,
+    responsible_id INTEGER NOT NULL DEFAULT 0,
+    changed_by INTEGER NOT NULL DEFAULT 0,
+    changed_date TIMESTAMP WITH TIME ZONE,
+    status_changed_by INTEGER NOT NULL DEFAULT 0,
+    closed_by INTEGER,
+    closed_date TIMESTAMP WITH TIME ZONE,
+    activity_date TIMESTAMP WITH TIME ZONE,
+    date_start TIMESTAMP WITH TIME ZONE,
+    deadline TIMESTAMP WITH TIME ZONE,
+    start_date_plan TIMESTAMP WITH TIME ZONE,
+    end_date_plan TIMESTAMP WITH TIME ZONE,
+    guid TEXT,
+    xml_id TEXT,
+    comments_count INTEGER,
+    service_comments_count INTEGER,
+    allow_change_deadline BOOLEAN NOT NULL DEFAULT FALSE,
+    allow_time_tracking BOOLEAN NOT NULL DEFAULT FALSE,   
+    task_control BOOLEAN NOT NULL DEFAULT FALSE,
+    add_in_report BOOLEAN NOT NULL DEFAULT FALSE,
+    forked_by_template_id INTEGER,
+    time_estimate INTEGER NOT NULL DEFAULT 0,
+    time_spent_in_logs INTEGER,
+    match_work_time BOOLEAN NOT NULL DEFAULT FALSE,
+    forum_topic_id INTEGER,
+    forum_id INTEGER,
+    site_id TEXT,
+    subordinate BOOLEAN NOT NULL DEFAULT FALSE,
+    exchange_modified TIMESTAMP WITH TIME ZONE,
+    exchange_id INTEGER,    
+    outlook_version INTEGER,
+    viewed_date TIMESTAMP WITH TIME ZONE,
+    sorting DOUBLE PRECISION,
+    duration_plan INTEGER,
+    duration_fact INTEGER,    
+    duration_type TEXT NOT NULL DEFAULT 'days',
+    is_muted BOOLEAN NOT NULL DEFAULT FALSE,
+    is_pinned BOOLEAN NOT NULL DEFAULT FALSE,
+    is_pinned_in_group BOOLEAN NOT NULL DEFAULT FALSE,    
+    flow_id INTEGER,
+    description_in_bbcode BOOLEAN NOT NULL DEFAULT FALSE,
+    status INTEGER NOT NULL DEFAULT 2, 
+    status_changed_date TIMESTAMP WITH TIME ZONE, 
+    favorite BOOLEAN NOT NULL DEFAULT FALSE,    
+    group_id INTEGER NOT NULL DEFAULT 0,
+    auditors JSONB NOT NULL DEFAULT '[]'::jsonb,    
+    accomplices JSONB NOT NULL DEFAULT '[]'::jsonb,
+    new_comments_count INTEGER NOT NULL DEFAULT 0,
+    group NOT NULL DEFAULT '[]'::jsonb,
+    creator INTEGER NOT NULL DEFAULT 0,
+    responsible INTEGER NOT NULL DEFAULT 0,
+    accomplices_data NOT NULL DEFAULT '[]'::jsonb,
+    auditors_data NOT NULL DEFAULT '[]'::jsonb,
+    sub_status INTEGER NOT NULL DEFAULT 0
+);
+
+-- Опционально: добавляем комментарий к таблице
+COMMENT ON TABLE tasks IS 'Таблица для хранения задач из Bitrix24';
+
+
+CREATE TABLE IF NOT EXISTS projects (
+    id TEXT PRIMARY KEY,
+    active TEXT CHECK (active IN ('Y', 'N')),
+    subject_id TEXT NOT NULL,
+    subject_data JSONB,
+    name TEXT NOT NULL,
+    description TEXT,
+    keywords TEXT,
+    closed TEXT CHECK (closed IN ('Y', 'N')),
+    visible TEXT CHECK (visible IN ('Y', 'N')),
+    opened TEXT CHECK (opened IN ('Y', 'N')),
+    project TEXT CHECK (project IN ('Y', 'N')) DEFAULT 'N',
+    landing TEXT CHECK (landing IN ('Y', 'N')),
+    date_create TIMESTAMP,
+    date_update TIMESTAMP,
+    date_activity TIMESTAMP,
+    image_id TEXT,
+    avatar TEXT,
+    avatar_types JSONB,
+    avatar_type TEXT CHECK (avatar_type IN ('folder', 'checks', 'pie', 'bag', 'members')),
+    owner_id TEXT,
+    owner_data JSONB,
+    number_of_members INTEGER,
+    number_of_moderators INTEGER,
+    initiate_perms TEXT CHECK (initiate_perms IN ('A', 'E', 'K')) NOT NULL,
+    project_date_start TIMESTAMP,
+    project_date_finish TIMESTAMP,
+    scrum_owner_id TEXT,
+    scrum_master_id TEXT,
+    scrum_sprint_duration INTEGER,
+    scrum_task_responsible TEXT CHECK (scrum_task_responsible IN ('A', 'M')),
+    tags TEXT,
+    actions JSONB,
+    user_data JSONB,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_deals_status ON deals (status);
+CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks (status);
+CREATE INDEX IF NOT EXISTS idx_projects_active ON projects (active);
