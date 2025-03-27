@@ -4,10 +4,12 @@ import json
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import psycopg2
+from psycopg2 import extras
 import requests
 import threading
 from datetime import datetime
 import urllib3
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -83,16 +85,42 @@ def get_count_from_bitrix(entity):
         logger.error(f"Error fetching {entity} count from Bitrix: {e}")
         return 0
 
-def sync_entity(entity, batch_size=50):
+def fetch_batch(entity, start, batch_size, last_synced_id=None):
+    try:
+        if entity == "deals":
+            url = f"{BITRIX_URL}crm.deal.list"
+            params = {"start": start, "SELECT[]": "*"}
+            if last_synced_id:
+                params["filter[>ID]"] = last_synced_id
+        elif entity == "tasks":
+            url = f"{BITRIX_URL}tasks.task.list"
+            params = {"order[ID]": "ASC", "start": start, "select[]": "*"}
+            if last_synced_id:
+                params["filter[>ID]"] = last_synced_id
+        elif entity == "projects":
+            url = f"{BITRIX_URL}sonet_group.get"
+            params = {"start": start, "SELECT[]": "*"}
+            if last_synced_id:
+                params["filter[>ID]"] = last_synced_id
+
+        response = requests.get(url, params=params, timeout=120, verify=False)
+        response.raise_for_status()
+        data = response.json()
+        items = data["result"]["tasks"] if entity == "tasks" else data["result"]
+        return items if isinstance(items, list) else [], data.get("next")
+    except Exception as e:
+        logger.error(f"Failed to fetch batch for {entity} at start {start}: {e}")
+        return [], None
+
+def sync_entity(entity, batch_size=50, max_workers=8):
     sync_status[entity]["running"] = True
     sync_status[entity]["last_run"] = datetime.now().isoformat()
-    sync_status[entity]["stop_requested"] = False  # Сбрасываем флаг остановки
+    sync_status[entity]["stop_requested"] = False
     try:
         total = get_count_from_bitrix(entity)
         sync_status[entity]["total"] = total
         
         last_synced_id = get_max_id_from_db(entity)
-        start = 0
         if last_synced_id:
             logger.info(f"Resuming {entity} sync from last_synced_id: {last_synced_id}")
             sync_status[entity]["progress"] = get_count_from_db(entity)
@@ -100,64 +128,207 @@ def sync_entity(entity, batch_size=50):
             logger.info(f"Starting {entity} sync from scratch")
             sync_status[entity]["progress"] = 0
 
-        while True:
-            if sync_status[entity]["stop_requested"]:
-                logger.info(f"Sync for {entity} stopped by user")
-                break
+        start = 0
+        items_to_insert = []
 
-            if entity == "deals":
-                url = f"{BITRIX_URL}crm.deal.list"
-                insert_func = insert_deal
-                params = {"start": start, "SELECT[]": "*"}
-                if last_synced_id:
-                    params["filter[>ID]"] = last_synced_id
-            elif entity == "tasks":
-                url = f"{BITRIX_URL}tasks.task.list"
-                insert_func = insert_task
-                params = {"order[ID]": "ASC", "start": start, "select[]": "*"}
-                if last_synced_id:
-                    params["filter[>ID]"] = last_synced_id
-            elif entity == "projects":
-                url = f"{BITRIX_URL}sonet_group.get"
-                insert_func = insert_project
-                params = {"start": start, "SELECT[]": "*"}
-                if last_synced_id:
-                    params["filter[>ID]"] = last_synced_id
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            while sync_status[entity]["progress"] < total and not sync_status[entity]["stop_requested"]:
+                futures = []
+                for i in range(max_workers):
+                    batch_start = start + (i * batch_size)
+                    if batch_start >= total:
+                        break
+                    futures.append(executor.submit(fetch_batch, entity, batch_start, batch_size, last_synced_id))
 
-            response = requests.get(url, params=params, timeout=120, verify=False)
-            response.raise_for_status()
-            data = response.json()
-            logger.info(f"Response for {entity} at start {start}: {data}")
+                for future in as_completed(futures):
+                    if sync_status[entity]["stop_requested"]:
+                        logger.info(f"Sync for {entity} stopped by user")
+                        break
+                    items, next_start = future.result()
+                    if not items:
+                        continue
+                    items_to_insert.extend(items)
+                    if len(items_to_insert) >= batch_size * 2 or next_start is None:
+                        insert_batch(entity, items_to_insert)
+                        sync_status[entity]["progress"] += len(items_to_insert)
+                        items_to_insert = []
+                    if next_start:
+                        start = next_start
 
-            if "result" not in data:
-                logger.error(f"No 'result' in response for {entity}: {data}")
-                break
-
-            items = data["result"]["tasks"] if entity == "tasks" else data["result"]
-            if not isinstance(items, list):
-                logger.error(f"Items is not a list for {entity}: {items}")
-                break
-
-            for item in items:
-                if sync_status[entity]["stop_requested"]:
-                    logger.info(f"Sync for {entity} stopped by user during item processing")
+                if not futures or sync_status[entity]["stop_requested"]:
                     break
-                if not isinstance(item, dict) or ("ID" not in item and "id" not in item):
-                    logger.error(f"Invalid item in {entity}: {item}")
-                    continue
-                insert_func(item)
-                sync_status[entity]["progress"] += 1
 
-            if "next" not in data or sync_status[entity]["progress"] >= total:
-                break
-            start = data["next"]
+            if items_to_insert and not sync_status[entity]["stop_requested"]:
+                insert_batch(entity, items_to_insert)
+                sync_status[entity]["progress"] += len(items_to_insert)
 
         logger.info(f"Synchronized {entity}: {sync_status[entity]['progress']} of {total} items")
     except Exception as e:
         logger.error(f"Sync {entity} failed: {e}")
     finally:
         sync_status[entity]["running"] = False
-        sync_status[entity]["stop_requested"] = False  # Сбрасываем флаг после завершения
+        sync_status[entity]["stop_requested"] = False
+
+def insert_batch(entity, items):
+    if not items:
+        return
+    try:
+        with psycopg2.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                if entity == "deals":
+                    query = """
+                        INSERT INTO deals (id, title, amount, status, updated_at)
+                        VALUES (%s, %s, %s, %s, NOW())
+                        ON CONFLICT (id) DO UPDATE 
+                        SET title = EXCLUDED.title, 
+                            amount = EXCLUDED.amount,
+                            status = EXCLUDED.status,
+                            updated_at = NOW()
+                    """
+                    data = [(item["ID"], item["TITLE"], float(item.get("OPPORTUNITY", 0) or 0), item["STAGE_ID"])
+                            for item in items if isinstance(item, dict) and "ID" in item]
+                    extras.execute_batch(cur, query, data)
+                elif entity == "tasks":
+                    query = """
+                        INSERT INTO tasks (
+                            id, parent_id, title, description, mark, priority, multitask, not_viewed, replicate,
+                            stage_id, created_by, created_date, responsible_id, changed_by, changed_date,
+                            status_changed_by, closed_by, closed_date, activity_date, date_start, deadline,
+                            start_date_plan, end_date_plan, guid, xml_id, comments_count, service_comments_count,
+                            allow_change_deadline, allow_time_tracking, task_control, add_in_report,
+                            forked_by_template_id, time_estimate, time_spent_in_logs, match_work_time,
+                            forum_topic_id, forum_id, site_id, subordinate, exchange_modified, exchange_id,
+                            outlook_version, viewed_date, sorting, duration_plan, duration_fact, duration_type,
+                            is_muted, is_pinned, is_pinned_in_group, flow_id, description_in_bbcode, status,
+                            status_changed_date, favorite, group_id, auditors, accomplices, new_comments_count,
+                            "group", creator, responsible, accomplices_data, auditors_data, sub_status
+                        )
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                                %s, %s, %s, %s, %s)
+                        ON CONFLICT (id) DO UPDATE SET
+                            parent_id = EXCLUDED.parent_id, title = EXCLUDED.title, description = EXCLUDED.description,
+                            mark = EXCLUDED.mark, priority = EXCLUDED.priority, multitask = EXCLUDED.multitask,
+                            not_viewed = EXCLUDED.not_viewed, replicate = EXCLUDED.replicate,
+                            stage_id = EXCLUDED.stage_id, created_by = EXCLUDED.created_by,
+                            created_date = EXCLUDED.created_date, responsible_id = EXCLUDED.responsible_id,
+                            changed_by = EXCLUDED.changed_by, changed_date = EXCLUDED.changed_date,
+                            status_changed_by = EXCLUDED.status_changed_by, closed_by = EXCLUDED.closed_by,
+                            closed_date = EXCLUDED.closed_date, activity_date = EXCLUDED.activity_date,
+                            date_start = EXCLUDED.date_start, deadline = EXCLUDED.deadline,
+                            start_date_plan = EXCLUDED.start_date_plan, end_date_plan = EXCLUDED.end_date_plan,
+                            guid = EXCLUDED.guid, xml_id = EXCLUDED.xml_id, comments_count = EXCLUDED.comments_count,
+                            service_comments_count = EXCLUDED.service_comments_count,
+                            allow_change_deadline = EXCLUDED.allow_change_deadline,
+                            allow_time_tracking = EXCLUDED.allow_time_tracking, task_control = EXCLUDED.task_control,
+                            add_in_report = EXCLUDED.add_in_report, forked_by_template_id = EXCLUDED.forked_by_template_id,
+                            time_estimate = EXCLUDED.time_estimate, time_spent_in_logs = EXCLUDED.time_spent_in_logs,
+                            match_work_time = EXCLUDED.match_work_time, forum_topic_id = EXCLUDED.forum_topic_id,
+                            forum_id = EXCLUDED.forum_id, site_id = EXCLUDED.site_id, subordinate = EXCLUDED.subordinate,
+                            exchange_modified = EXCLUDED.exchange_modified, exchange_id = EXCLUDED.exchange_id,
+                            outlook_version = EXCLUDED.outlook_version, viewed_date = EXCLUDED.viewed_date,
+                            sorting = EXCLUDED.sorting, duration_plan = EXCLUDED.duration_plan,
+                            duration_fact = EXCLUDED.duration_fact, duration_type = EXCLUDED.duration_type,
+                            is_muted = EXCLUDED.is_muted, is_pinned = EXCLUDED.is_pinned,
+                            is_pinned_in_group = EXCLUDED.is_pinned_in_group, flow_id = EXCLUDED.flow_id,
+                            description_in_bbcode = EXCLUDED.description_in_bbcode, status = EXCLUDED.status,
+                            status_changed_date = EXCLUDED.status_changed_date, favorite = EXCLUDED.favorite,
+                            group_id = EXCLUDED.group_id, auditors = EXCLUDED.auditors, accomplices = EXCLUDED.accomplices,
+                            new_comments_count = EXCLUDED.new_comments_count, "group" = EXCLUDED."group",
+                            creator = EXCLUDED.creator, responsible = EXCLUDED.responsible,
+                            accomplices_data = EXCLUDED.accomplices_data, auditors_data = EXCLUDED.auditors_data,
+                            sub_status = EXCLUDED.sub_status
+                    """
+                    data = [
+                        (
+                            item.get("id"), item.get("parentId"), item.get("title", ""), item.get("description"),
+                            item.get("mark"), item.get("priority", "1"), convert_yn_to_bool(item.get("multitask", "N")),
+                            convert_yn_to_bool(item.get("notViewed", "N")), convert_yn_to_bool(item.get("replicate", "N")),
+                            item.get("stageId", "0"), item.get("createdBy", "0"), item.get("createdDate"),
+                            item.get("responsibleId", "0"), item.get("changedBy", "0"), item.get("changedDate"),
+                            item.get("statusChangedBy") if item.get("statusChangedBy") is not None else "0",
+                            item.get("closedBy"), item.get("closedDate"), item.get("activityDate"), item.get("dateStart"),
+                            item.get("deadline"), item.get("startDatePlan"), item.get("endDatePlan"), item.get("guid"),
+                            item.get("xmlId"), item.get("commentsCount"), item.get("serviceCommentsCount"),
+                            convert_yn_to_bool(item.get("allowChangeDeadline", "N")),
+                            convert_yn_to_bool(item.get("allowTimeTracking", "N")),
+                            convert_yn_to_bool(item.get("taskControl", "N")),
+                            convert_yn_to_bool(item.get("addInReport", "N")),
+                            item.get("forkedByTemplateId"), item.get("timeEstimate", "0"), item.get("timeSpentInLogs"),
+                            convert_yn_to_bool(item.get("matchWorkTime", "N")), item.get("forumTopicId"),
+                            item.get("forumId"), item.get("siteId"), convert_yn_to_bool(item.get("subordinate", "N")),
+                            item.get("exchangeModified"), item.get("exchangeId"), item.get("outlookVersion"),
+                            item.get("viewedDate"), item.get("sorting"), item.get("durationPlan"),
+                            item.get("durationFact"), item.get("durationType", "days"),
+                            convert_yn_to_bool(item.get("isMuted", "N")), convert_yn_to_bool(item.get("isPinned", "N")),
+                            convert_yn_to_bool(item.get("isPinnedInGroup", "N")), item.get("flowId"),
+                            convert_yn_to_bool(item.get("descriptionInBbcode", "N")), item.get("status", "2"),
+                            item.get("statusChangedDate"), convert_yn_to_bool(item.get("favorite", "N")),
+                            item.get("groupId", "0"), json.dumps(item.get("auditors", [])),
+                            json.dumps(item.get("accomplices", [])), item.get("newCommentsCount", 0),
+                            json.dumps(item.get("group", [])), item.get("creator", {}).get("id", "0"),
+                            item.get("responsible", {}).get("id", "0"), json.dumps(item.get("accomplicesData", [])),
+                            json.dumps(item.get("auditorsData", [])), item.get("subStatus", "0")
+                        )
+                        for item in items if isinstance(item, dict) and "id" in item
+                    ]
+                    extras.execute_batch(cur, query, data)
+                elif entity == "projects":
+                    query = """
+                        INSERT INTO projects (
+                            id, active, subject_id, subject_data, name, description, keywords, closed, visible,
+                            opened, project, landing, date_create, date_update, date_activity, image_id, avatar,
+                            avatar_types, avatar_type, owner_id, owner_data, number_of_members,
+                            number_of_moderators, initiate_perms, project_date_start, project_date_finish,
+                            scrum_owner_id, scrum_master_id, scrum_sprint_duration, scrum_task_responsible,
+                            tags, actions, user_data, updated_at
+                        )
+                        VALUES (
+                            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW()
+                        )
+                        ON CONFLICT (id) DO UPDATE SET
+                            active = EXCLUDED.active, subject_id = EXCLUDED.subject_id,
+                            subject_data = EXCLUDED.subject_data, name = EXCLUDED.name,
+                            description = EXCLUDED.description, keywords = EXCLUDED.keywords,
+                            closed = EXCLUDED.closed, visible = EXCLUDED.visible, opened = EXCLUDED.opened,
+                            project = EXCLUDED.project, landing = EXCLUDED.landing,
+                            date_create = EXCLUDED.date_create, date_update = EXCLUDED.date_update,
+                            date_activity = EXCLUDED.date_activity, image_id = EXCLUDED.image_id,
+                            avatar = EXCLUDED.avatar, avatar_types = EXCLUDED.avatar_types,
+                            avatar_type = EXCLUDED.avatar_type, owner_id = EXCLUDED.owner_id,
+                            owner_data = EXCLUDED.owner_data, number_of_members = EXCLUDED.number_of_members,
+                            number_of_moderators = EXCLUDED.number_of_moderators,
+                            initiate_perms = EXCLUDED.initiate_perms,
+                            project_date_start = EXCLUDED.project_date_start,
+                            project_date_finish = EXCLUDED.project_date_finish,
+                            scrum_owner_id = EXCLUDED.scrum_owner_id, scrum_master_id = EXCLUDED.scrum_master_id,
+                            scrum_sprint_duration = EXCLUDED.scrum_sprint_duration,
+                            scrum_task_responsible = EXCLUDED.scrum_task_responsible, tags = EXCLUDED.tags,
+                            actions = EXCLUDED.actions, user_data = EXCLUDED.user_data, updated_at = NOW()
+                    """
+                    data = [
+                        (
+                            item["ID"], item.get("ACTIVE"), item["SUBJECT_ID"], json.dumps(item.get("SUBJECT_DATA", {})),
+                            item["NAME"], item.get("DESCRIPTION"), item.get("KEYWORDS"), item.get("CLOSED"),
+                            item.get("VISIBLE"), item.get("OPENED"), item.get("PROJECT"), item.get("LANDING"),
+                            item.get("DATE_CREATE"), item.get("DATE_UPDATE"), item.get("DATE_ACTIVITY"),
+                            item.get("IMAGE_ID"), item.get("AVATAR"), json.dumps(item.get("AVATAR_TYPES", {})),
+                            item.get("AVATAR_TYPE"), item.get("OWNER_ID"), json.dumps(item.get("OWNER_DATA", {})),
+                            item.get("NUMBER_OF_MEMBERS"), item.get("NUMBER_OF_MODERATORS"), item["INITIATE_PERMS"],
+                            item.get("PROJECT_DATE_START"), item.get("PROJECT_DATE_FINISH"), item.get("SCRUM_OWNER_ID"),
+                            item.get("SCRUM_MASTER_ID"), item.get("SCRUM_SPRINT_DURATION"),
+                            item.get("SCRUM_TASK_RESPONSIBLE"), item.get("TAGS"), json.dumps(item.get("ACTIONS", {})),
+                            json.dumps(item.get("USER_DATA", {}))
+                        )
+                        for item in items if isinstance(item, dict) and "ID" in item
+                    ]
+                    extras.execute_batch(cur, query, data)
+                conn.commit()
+        logger.info(f"Inserted {len(data)} {entity} items into database")
+    except Exception as e:
+        logger.error(f"Failed to insert batch for {entity}: {e}")
 
 def clear_table(entity):
     table_map = {"deals": "deals", "tasks": "tasks", "projects": "projects"}
@@ -174,173 +345,12 @@ def clear_table(entity):
     except Exception as e:
         logger.error(f"Failed to clear table {entity}: {e}")
 
-def insert_deal(data):
-    with psycopg2.connect(DATABASE_URL) as conn:
-        with conn.cursor() as cur:
-            amount = float(data.get("OPPORTUNITY", 0) or 0)
-            cur.execute("""
-                INSERT INTO deals (id, title, amount, status, updated_at)
-                VALUES (%s, %s, %s, %s, NOW())
-                ON CONFLICT (id) DO UPDATE 
-                SET title = EXCLUDED.title, 
-                    amount = EXCLUDED.amount,
-                    status = EXCLUDED.status,
-                    updated_at = NOW()
-            """, (data["ID"], data["TITLE"], amount, data["STAGE_ID"]))
-            conn.commit()
-
 def convert_yn_to_bool(value):
     if value == "Y":
         return True
     elif value == "N":
         return False
     return False
-
-def insert_task(data):
-    try:
-        logger.info(f"Inserting task: {data}")
-        accomplices = json.dumps(data.get("accomplices", []))
-        auditors = json.dumps(data.get("auditors", []))
-        group = json.dumps(data.get("group", []))
-        accomplices_data = json.dumps(data.get("accomplicesData", []))
-        auditors_data = json.dumps(data.get("auditorsData", []))
-        creator_id = data.get("creator", {}).get("id", "0")
-        responsible_id = data.get("responsible", {}).get("id", "0")
-        status_changed_by = data.get("statusChangedBy")
-
-        with psycopg2.connect(DATABASE_URL) as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO tasks (
-                        id, parent_id, title, description, mark, priority, multitask, not_viewed, replicate,
-                        stage_id, created_by, created_date, responsible_id, changed_by, changed_date,
-                        status_changed_by, closed_by, closed_date, activity_date, date_start, deadline,
-                        start_date_plan, end_date_plan, guid, xml_id, comments_count, service_comments_count,
-                        allow_change_deadline, allow_time_tracking, task_control, add_in_report,
-                        forked_by_template_id, time_estimate, time_spent_in_logs, match_work_time,
-                        forum_topic_id, forum_id, site_id, subordinate, exchange_modified, exchange_id,
-                        outlook_version, viewed_date, sorting, duration_plan, duration_fact, duration_type,
-                        is_muted, is_pinned, is_pinned_in_group, flow_id, description_in_bbcode, status,
-                        status_changed_date, favorite, group_id, auditors, accomplices, new_comments_count,
-                        "group", creator, responsible, accomplices_data, auditors_data, sub_status
-                    )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                            %s, %s, %s, %s, %s)
-                    ON CONFLICT (id) DO UPDATE SET
-                        parent_id = EXCLUDED.parent_id, title = EXCLUDED.title, description = EXCLUDED.description,
-                        mark = EXCLUDED.mark, priority = EXCLUDED.priority, multitask = EXCLUDED.multitask,
-                        not_viewed = EXCLUDED.not_viewed, replicate = EXCLUDED.replicate,
-                        stage_id = EXCLUDED.stage_id, created_by = EXCLUDED.created_by,
-                        created_date = EXCLUDED.created_date, responsible_id = EXCLUDED.responsible_id,
-                        changed_by = EXCLUDED.changed_by, changed_date = EXCLUDED.changed_date,
-                        status_changed_by = EXCLUDED.status_changed_by, closed_by = EXCLUDED.closed_by,
-                        closed_date = EXCLUDED.closed_date, activity_date = EXCLUDED.activity_date,
-                        date_start = EXCLUDED.date_start, deadline = EXCLUDED.deadline,
-                        start_date_plan = EXCLUDED.start_date_plan, end_date_plan = EXCLUDED.end_date_plan,
-                        guid = EXCLUDED.guid, xml_id = EXCLUDED.xml_id, comments_count = EXCLUDED.comments_count,
-                        service_comments_count = EXCLUDED.service_comments_count,
-                        allow_change_deadline = EXCLUDED.allow_change_deadline,
-                        allow_time_tracking = EXCLUDED.allow_time_tracking, task_control = EXCLUDED.task_control,
-                        add_in_report = EXCLUDED.add_in_report, forked_by_template_id = EXCLUDED.forked_by_template_id,
-                        time_estimate = EXCLUDED.time_estimate, time_spent_in_logs = EXCLUDED.time_spent_in_logs,
-                        match_work_time = EXCLUDED.match_work_time, forum_topic_id = EXCLUDED.forum_topic_id,
-                        forum_id = EXCLUDED.forum_id, site_id = EXCLUDED.site_id, subordinate = EXCLUDED.subordinate,
-                        exchange_modified = EXCLUDED.exchange_modified, exchange_id = EXCLUDED.exchange_id,
-                        outlook_version = EXCLUDED.outlook_version, viewed_date = EXCLUDED.viewed_date,
-                        sorting = EXCLUDED.sorting, duration_plan = EXCLUDED.duration_plan,
-                        duration_fact = EXCLUDED.duration_fact, duration_type = EXCLUDED.duration_type,
-                        is_muted = EXCLUDED.is_muted, is_pinned = EXCLUDED.is_pinned,
-                        is_pinned_in_group = EXCLUDED.is_pinned_in_group, flow_id = EXCLUDED.flow_id,
-                        description_in_bbcode = EXCLUDED.description_in_bbcode, status = EXCLUDED.status,
-                        status_changed_date = EXCLUDED.status_changed_date, favorite = EXCLUDED.favorite,
-                        group_id = EXCLUDED.group_id, auditors = EXCLUDED.auditors, accomplices = EXCLUDED.accomplices,
-                        new_comments_count = EXCLUDED.new_comments_count, "group" = EXCLUDED."group",
-                        creator = EXCLUDED.creator, responsible = EXCLUDED.responsible,
-                        accomplices_data = EXCLUDED.accomplices_data, auditors_data = EXCLUDED.auditors_data,
-                        sub_status = EXCLUDED.sub_status
-                """, (
-                    data.get("id"), data.get("parentId"), data.get("title", ""), data.get("description"),
-                    data.get("mark"), data.get("priority", "1"), convert_yn_to_bool(data.get("multitask", "N")),
-                    convert_yn_to_bool(data.get("notViewed", "N")), convert_yn_to_bool(data.get("replicate", "N")),
-                    data.get("stageId", "0"), data.get("createdBy", "0"), data.get("createdDate"),
-                    data.get("responsibleId", "0"), data.get("changedBy", "0"), data.get("changedDate"),
-                    status_changed_by, data.get("closedBy"), data.get("closedDate"),
-                    data.get("activityDate"), data.get("dateStart"), data.get("deadline"),
-                    data.get("startDatePlan"), data.get("endDatePlan"), data.get("guid"), data.get("xmlId"),
-                    data.get("commentsCount"), data.get("serviceCommentsCount"),
-                    convert_yn_to_bool(data.get("allowChangeDeadline", "N")),
-                    convert_yn_to_bool(data.get("allowTimeTracking", "N")),
-                    convert_yn_to_bool(data.get("taskControl", "N")),
-                    convert_yn_to_bool(data.get("addInReport", "N")),
-                    data.get("forkedByTemplateId"), data.get("timeEstimate", "0"), data.get("timeSpentInLogs"),
-                    convert_yn_to_bool(data.get("matchWorkTime", "N")), data.get("forumTopicId"),
-                    data.get("forumId"), data.get("siteId"), convert_yn_to_bool(data.get("subordinate", "N")),
-                    data.get("exchangeModified"), data.get("exchangeId"), data.get("outlookVersion"),
-                    data.get("viewedDate"), data.get("sorting"), data.get("durationPlan"),
-                    data.get("durationFact"), data.get("durationType", "days"),
-                    convert_yn_to_bool(data.get("isMuted", "N")), convert_yn_to_bool(data.get("isPinned", "N")),
-                    convert_yn_to_bool(data.get("isPinnedInGroup", "N")), data.get("flowId"),
-                    convert_yn_to_bool(data.get("descriptionInBbcode", "N")), data.get("status", "2"),
-                    data.get("statusChangedDate"), convert_yn_to_bool(data.get("favorite", "N")),
-                    data.get("groupId", "0"), auditors, accomplices, data.get("newCommentsCount", 0),
-                    group, creator_id, responsible_id, accomplices_data, auditors_data, data.get("subStatus", "0")
-                ))
-                conn.commit()
-    except Exception as e:
-        logger.error(f"Failed to insert task {data.get('id')}: {e}")
-        raise
-
-def insert_project(data):
-    with psycopg2.connect(DATABASE_URL) as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO projects (
-                    id, active, subject_id, subject_data, name, description, keywords, closed, visible,
-                    opened, project, landing, date_create, date_update, date_activity, image_id, avatar,
-                    avatar_types, avatar_type, owner_id, owner_data, number_of_members,
-                    number_of_moderators, initiate_perms, project_date_start, project_date_finish,
-                    scrum_owner_id, scrum_master_id, scrum_sprint_duration, scrum_task_responsible,
-                    tags, actions, user_data, updated_at
-                )
-                VALUES (
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW()
-                )
-                ON CONFLICT (id) DO UPDATE SET
-                    active = EXCLUDED.active, subject_id = EXCLUDED.subject_id,
-                    subject_data = EXCLUDED.subject_data, name = EXCLUDED.name,
-                    description = EXCLUDED.description, keywords = EXCLUDED.keywords,
-                    closed = EXCLUDED.closed, visible = EXCLUDED.visible, opened = EXCLUDED.opened,
-                    project = EXCLUDED.project, landing = EXCLUDED.landing,
-                    date_create = EXCLUDED.date_create, date_update = EXCLUDED.date_update,
-                    date_activity = EXCLUDED.date_activity, image_id = EXCLUDED.image_id,
-                    avatar = EXCLUDED.avatar, avatar_types = EXCLUDED.avatar_types,
-                    avatar_type = EXCLUDED.avatar_type, owner_id = EXCLUDED.owner_id,
-                    owner_data = EXCLUDED.owner_data, number_of_members = EXCLUDED.number_of_members,
-                    number_of_moderators = EXCLUDED.number_of_moderators,
-                    initiate_perms = EXCLUDED.initiate_perms,
-                    project_date_start = EXCLUDED.project_date_start,
-                    project_date_finish = EXCLUDED.project_date_finish,
-                    scrum_owner_id = EXCLUDED.scrum_owner_id, scrum_master_id = EXCLUDED.scrum_master_id,
-                    scrum_sprint_duration = EXCLUDED.scrum_sprint_duration,
-                    scrum_task_responsible = EXCLUDED.scrum_task_responsible, tags = EXCLUDED.tags,
-                    actions = EXCLUDED.actions, user_data = EXCLUDED.user_data, updated_at = NOW()
-            """, (
-                data["ID"], data.get("ACTIVE"), data["SUBJECT_ID"], json.dumps(data.get("SUBJECT_DATA", {})),
-                data["NAME"], data.get("DESCRIPTION"), data.get("KEYWORDS"), data.get("CLOSED"),
-                data.get("VISIBLE"), data.get("OPENED"), data.get("PROJECT"), data.get("LANDING"),
-                data.get("DATE_CREATE"), data.get("DATE_UPDATE"), data.get("DATE_ACTIVITY"),
-                data.get("IMAGE_ID"), data.get("AVATAR"), json.dumps(data.get("AVATAR_TYPES", {})),
-                data.get("AVATAR_TYPE"), data.get("OWNER_ID"), json.dumps(data.get("OWNER_DATA", {})),
-                data.get("NUMBER_OF_MEMBERS"), data.get("NUMBER_OF_MODERATORS"), data["INITIATE_PERMS"],
-                data.get("PROJECT_DATE_START"), data.get("PROJECT_DATE_FINISH"), data.get("SCRUM_OWNER_ID"),
-                data.get("SCRUM_MASTER_ID"), data.get("SCRUM_SPRINT_DURATION"),
-                data.get("SCRUM_TASK_RESPONSIBLE"), data.get("TAGS"), json.dumps(data.get("ACTIONS", {})),
-                json.dumps(data.get("USER_DATA", {}))
-            ))
-            conn.commit()
 
 def init_db():
     try:
