@@ -27,7 +27,7 @@ CREATE TABLE tasks (
     responsible_id INTEGER NOT NULL DEFAULT 0,
     changed_by INTEGER NOT NULL DEFAULT 0,
     changed_date TIMESTAMP WITH TIME ZONE,
-    status_changed_by INTEGER NOT NULL DEFAULT 0,
+    status_changed_by INTEGER,
     closed_by INTEGER,
     closed_date TIMESTAMP WITH TIME ZONE,
     activity_date TIMESTAMP WITH TIME ZONE,

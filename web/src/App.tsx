@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from "react";
 import axios, { AxiosError } from "axios";
 import StatusCard from "./components/StatusCard";
-import { FaSyncAlt, FaMoon, FaSun, FaTrashAlt } from "react-icons/fa";
+import { FaSyncAlt, FaMoon, FaSun, FaTrashAlt, FaStop } from "react-icons/fa";
 import { ServiceStatus } from "./types";
 import log from "loglevel";
 log.setLevel("error");
@@ -10,6 +10,7 @@ const SunIcon = FaSun as React.FC<React.SVGProps<SVGSVGElement>>;
 const MoonIcon = FaMoon as React.FC<React.SVGProps<SVGSVGElement>>;
 const SyncIcon = FaSyncAlt as React.FC<React.SVGProps<SVGSVGElement>>;
 const TrashIcon = FaTrashAlt as React.FC<React.SVGProps<SVGSVGElement>>;
+const StopIcon = FaStop as React.FC<React.SVGProps<SVGSVGElement>>;
 
 interface SyncCounts {
   bitrix: number;
@@ -21,6 +22,7 @@ interface SyncStatus {
   progress: number;
   total: number;
   last_run: string | null;
+  stop_requested: boolean; // Добавляем новое поле
 }
 
 const App: React.FC = () => {
@@ -42,7 +44,7 @@ const App: React.FC = () => {
 
   const fetchStatus = async () => {
     try {
-      const response = await axios.get<ServiceStatus>("/status", { timeout: 3000 });
+      const response = await axios.get<ServiceStatus>("/status", { timeout: 60000 });
       setStatus({
         backend: { status: response.data.backend.status },
         bitrix24: { ...response.data.bitrix24 },
@@ -79,11 +81,13 @@ const App: React.FC = () => {
     fetchStatus();
     fetchSyncCounts();
     fetchSyncStatus();
+
     const interval = setInterval(() => {
       fetchStatus();
       fetchSyncCounts();
       fetchSyncStatus();
     }, 5000);
+
     return () => clearInterval(interval);
   }, []);
 
@@ -113,6 +117,15 @@ const App: React.FC = () => {
     }
   };
 
+  const handleStopSync = async (entity: string) => {
+    try {
+      await axios.post(`/stop_sync/${entity}`);
+      log.info(`Requested to stop sync for ${entity}`);
+    } catch (err) {
+      log.error("Failed to stop sync:", err);
+    }
+  };
+
   const handleClear = (entity: string) => {
     setClearPrompt(entity);
   };
@@ -122,7 +135,7 @@ const App: React.FC = () => {
     try {
       await axios.post(`/clear/${clearPrompt}`);
       setClearPrompt(null);
-      fetchSyncCounts(); // Обновляем данные после очистки
+      fetchSyncCounts();
     } catch (err) {
       log.error("Failed to clear table:", err);
     }
@@ -199,6 +212,14 @@ const App: React.FC = () => {
                   >
                     <SyncIcon className="w-4 h-4 mr-2" /> Синхронизировать
                   </button>
+                  {syncStatus[table.entity]?.running && (
+                    <button
+                      onClick={() => handleStopSync(table.entity)}
+                      className="flex items-center px-3 py-1 rounded-lg shadow bg-orange-500 text-white hover:bg-orange-600 transition-colors"
+                    >
+                      <StopIcon className="w-4 h-4 mr-2" /> Остановить
+                    </button>
+                  )}
                   <button
                     onClick={() => handleClear(table.entity)}
                     disabled={syncStatus[table.entity]?.running}

@@ -14,7 +14,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "http://localhost:3000"}})
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, filename="app.log", format="%(asctime)s %(levelname)s:%(name)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -24,11 +24,10 @@ if not DATABASE_URL or not BITRIX_URL:
     raise ValueError("DATABASE_URL or BITRIX_URL not set")
 logger.info(f"DATABASE_URL: {DATABASE_URL}")
 
-# Глобальное состояние синхронизации
 sync_status = {
-    "deals": {"running": False, "progress": 0, "total": 0, "last_run": None},
-    "tasks": {"running": False, "progress": 0, "total": 0, "last_run": None},
-    "projects": {"running": False, "progress": 0, "total": 0, "last_run": None},
+    "deals": {"running": False, "progress": 0, "total": 0, "last_run": None, "stop_requested": False},
+    "tasks": {"running": False, "progress": 0, "total": 0, "last_run": None, "stop_requested": False},
+    "projects": {"running": False, "progress": 0, "total": 0, "last_run": None, "stop_requested": False},
 }
 
 def check_bitrix_status():
@@ -51,6 +50,17 @@ def get_count_from_db(table):
     except Exception as e:
         logger.error(f"Error counting {table}: {e}")
         return 0
+
+def get_max_id_from_db(table):
+    try:
+        with psycopg2.connect(DATABASE_URL) as conn:
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT MAX(id::integer) FROM {table}")
+                result = cur.fetchone()[0]
+                return str(result) if result is not None else None
+    except Exception as e:
+        logger.error(f"Error getting max id from {table}: {e}")
+        return None
 
 def get_count_from_bitrix(entity):
     try:
@@ -76,25 +86,43 @@ def get_count_from_bitrix(entity):
 def sync_entity(entity, batch_size=50):
     sync_status[entity]["running"] = True
     sync_status[entity]["last_run"] = datetime.now().isoformat()
+    sync_status[entity]["stop_requested"] = False  # Сбрасываем флаг остановки
     try:
         total = get_count_from_bitrix(entity)
         sync_status[entity]["total"] = total
-        sync_status[entity]["progress"] = 0
-
+        
+        last_synced_id = get_max_id_from_db(entity)
         start = 0
+        if last_synced_id:
+            logger.info(f"Resuming {entity} sync from last_synced_id: {last_synced_id}")
+            sync_status[entity]["progress"] = get_count_from_db(entity)
+        else:
+            logger.info(f"Starting {entity} sync from scratch")
+            sync_status[entity]["progress"] = 0
+
         while True:
+            if sync_status[entity]["stop_requested"]:
+                logger.info(f"Sync for {entity} stopped by user")
+                break
+
             if entity == "deals":
                 url = f"{BITRIX_URL}crm.deal.list"
                 insert_func = insert_deal
                 params = {"start": start, "SELECT[]": "*"}
+                if last_synced_id:
+                    params["filter[>ID]"] = last_synced_id
             elif entity == "tasks":
                 url = f"{BITRIX_URL}tasks.task.list"
                 insert_func = insert_task
                 params = {"order[ID]": "ASC", "start": start, "select[]": "*"}
+                if last_synced_id:
+                    params["filter[>ID]"] = last_synced_id
             elif entity == "projects":
                 url = f"{BITRIX_URL}sonet_group.get"
                 insert_func = insert_project
                 params = {"start": start, "SELECT[]": "*"}
+                if last_synced_id:
+                    params["filter[>ID]"] = last_synced_id
 
             response = requests.get(url, params=params, timeout=120, verify=False)
             response.raise_for_status()
@@ -105,20 +133,21 @@ def sync_entity(entity, batch_size=50):
                 logger.error(f"No 'result' in response for {entity}: {data}")
                 break
 
-            # Для задач данные находятся в result.tasks
             items = data["result"]["tasks"] if entity == "tasks" else data["result"]
             if not isinstance(items, list):
                 logger.error(f"Items is not a list for {entity}: {items}")
                 break
 
             for item in items:
+                if sync_status[entity]["stop_requested"]:
+                    logger.info(f"Sync for {entity} stopped by user during item processing")
+                    break
                 if not isinstance(item, dict) or ("ID" not in item and "id" not in item):
                     logger.error(f"Invalid item in {entity}: {item}")
                     continue
                 insert_func(item)
                 sync_status[entity]["progress"] += 1
 
-            # Проверяем наличие следующей страницы
             if "next" not in data or sync_status[entity]["progress"] >= total:
                 break
             start = data["next"]
@@ -128,6 +157,7 @@ def sync_entity(entity, batch_size=50):
         logger.error(f"Sync {entity} failed: {e}")
     finally:
         sync_status[entity]["running"] = False
+        sync_status[entity]["stop_requested"] = False  # Сбрасываем флаг после завершения
 
 def clear_table(entity):
     table_map = {"deals": "deals", "tasks": "tasks", "projects": "projects"}
@@ -140,6 +170,7 @@ def clear_table(entity):
                 cur.execute(f"TRUNCATE TABLE {table_map[entity]}")
                 conn.commit()
         logger.info(f"Table {entity} cleared")
+        sync_status[entity]["progress"] = 0
     except Exception as e:
         logger.error(f"Failed to clear table {entity}: {e}")
 
@@ -159,26 +190,24 @@ def insert_deal(data):
             conn.commit()
 
 def convert_yn_to_bool(value):
-    """Преобразует 'Y'/'N' в True/False."""
     if value == "Y":
         return True
     elif value == "N":
         return False
-    return False  # По умолчанию False, если значение некорректно
+    return False
 
 def insert_task(data):
     try:
-        # Логируем данные задачи
         logger.info(f"Inserting task: {data}")
-
-        # Подготовка значений для JSONB полей
         accomplices = json.dumps(data.get("accomplices", []))
         auditors = json.dumps(data.get("auditors", []))
         group = json.dumps(data.get("group", []))
         accomplices_data = json.dumps(data.get("accomplicesData", []))
         auditors_data = json.dumps(data.get("auditorsData", []))
+        creator_id = data.get("creator", {}).get("id", "0")
+        responsible_id = data.get("responsible", {}).get("id", "0")
+        status_changed_by = data.get("statusChangedBy")
 
-        # Подключение к базе данных
         with psycopg2.connect(DATABASE_URL) as conn:
             with conn.cursor() as cur:
                 cur.execute("""
@@ -195,12 +224,10 @@ def insert_task(data):
                         status_changed_date, favorite, group_id, auditors, accomplices, new_comments_count,
                         "group", creator, responsible, accomplices_data, auditors_data, sub_status
                     )
-                    VALUES (
-                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                        %s, %s, %s
-                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                            %s, %s, %s, %s, %s)
                     ON CONFLICT (id) DO UPDATE SET
                         parent_id = EXCLUDED.parent_id, title = EXCLUDED.title, description = EXCLUDED.description,
                         mark = EXCLUDED.mark, priority = EXCLUDED.priority, multitask = EXCLUDED.multitask,
@@ -234,71 +261,31 @@ def insert_task(data):
                         accomplices_data = EXCLUDED.accomplices_data, auditors_data = EXCLUDED.auditors_data,
                         sub_status = EXCLUDED.sub_status
                 """, (
-                    data.get("id"),  # 1 integer
-                    data.get("parentId"),  # 2 integer
-                    data.get("title", ""),  # 3 text
-                    data.get("description"),  # 4 text
-                    data.get("mark"),  # 5 text
-                    data.get("priority", "1"),  # 6 integer
-                    convert_yn_to_bool(data.get("multitask", "N")),  # 7 boolean
-                    convert_yn_to_bool(data.get("notViewed", "N")),  # 8 boolean
-                    convert_yn_to_bool(data.get("replicate", "N")),  # 9 boolean
-                    data.get("stageId", "0"),  # 10 integer
-                    data.get("createdBy", "0"),  # 11 integer
-                    data.get("createdDate"),  # 12 timestamp
-                    data.get("responsibleId", "0"),  # 13 integer
-                    data.get("changedBy", "0"),  # 14 integer
-                    data.get("changedDate"),  # 15 timestamp
-                    data.get("statusChangedBy", "0"),  # 16 integer
-                    data.get("closedBy"),  # 17 integer
-                    data.get("closedDate"),  # 18 timestamp
-                    data.get("activityDate"),  # 19 timestamp
-                    data.get("dateStart"),  # 20 timestamp
-                    data.get("deadline"),  # 21 timestamp
-                    data.get("startDatePlan"),  # 22 timestamp
-                    data.get("endDatePlan"),  # 23 timestamp
-                    data.get("guid"),  # 24 text
-                    data.get("xmlId"),  # 25 text
-                    data.get("commentsCount"),  # 26 integer
-                    data.get("serviceCommentsCount"),  # 27 integer
-                    convert_yn_to_bool(data.get("allowChangeDeadline", "N")),  # 28 boolean
-                    convert_yn_to_bool(data.get("allowTimeTracking", "N")),  # 29 boolean
-                    convert_yn_to_bool(data.get("taskControl", "N")),  # 30 boolean
-                    convert_yn_to_bool(data.get("addInReport", "N")),  # 31 boolean
-                    data.get("forkedByTemplateId"),  # 32 integer
-                    data.get("timeEstimate", "0"),  # 33 integer
-                    data.get("timeSpentInLogs"),  # 34 integer
-                    convert_yn_to_bool(data.get("matchWorkTime", "N")),  # 35 boolean
-                    data.get("forumTopicId"),  # 36 integer
-                    data.get("forumId"),  # 37 integer
-                    data.get("siteId"),  # 38 text
-                    convert_yn_to_bool(data.get("subordinate", "N")),  # 39 boolean
-                    data.get("exchangeModified"),  # 40 timestamp
-                    data.get("exchangeId"),  # 41 integer
-                    data.get("outlookVersion"),  # 42 integer
-                    data.get("viewedDate"),  # 43 timestamp
-                    data.get("sorting"),  # 44 double precision
-                    data.get("durationPlan"),  # 45 integer
-                    data.get("durationFact"),  # 46 integer
-                    data.get("durationType", "days"),  # 47 text
-                    convert_yn_to_bool(data.get("isMuted", "N")),  # 48 boolean
-                    convert_yn_to_bool(data.get("isPinned", "N")),  # 49 boolean
-                    convert_yn_to_bool(data.get("isPinnedInGroup", "N")),  # 50 boolean
-                    data.get("flowId"),  # 51 integer
-                    convert_yn_to_bool(data.get("descriptionInBbcode", "N")),  # 52 boolean
-                    data.get("status", "2"),  # 53 integer
-                    data.get("statusChangedDate"),  # 54 timestamp
-                    convert_yn_to_bool(data.get("favorite", "N")),  # 55 boolean
-                    data.get("groupId", "0"),  # 56 integer
-                    auditors,  # 57 jsonb
-                    accomplices,  # 58 jsonb
-                    data.get("newCommentsCount", 0),  # 59 integer
-                    group,  # 60 jsonb
-                    data.get("creator", "0"),  # 61 integer
-                    data.get("responsibleId", "0"),  # 62 integer
-                    accomplices_data,  # 63 jsonb
-                    auditors_data,  # 64 jsonb
-                    data.get("subStatus", "0")  # 65 integer
+                    data.get("id"), data.get("parentId"), data.get("title", ""), data.get("description"),
+                    data.get("mark"), data.get("priority", "1"), convert_yn_to_bool(data.get("multitask", "N")),
+                    convert_yn_to_bool(data.get("notViewed", "N")), convert_yn_to_bool(data.get("replicate", "N")),
+                    data.get("stageId", "0"), data.get("createdBy", "0"), data.get("createdDate"),
+                    data.get("responsibleId", "0"), data.get("changedBy", "0"), data.get("changedDate"),
+                    status_changed_by, data.get("closedBy"), data.get("closedDate"),
+                    data.get("activityDate"), data.get("dateStart"), data.get("deadline"),
+                    data.get("startDatePlan"), data.get("endDatePlan"), data.get("guid"), data.get("xmlId"),
+                    data.get("commentsCount"), data.get("serviceCommentsCount"),
+                    convert_yn_to_bool(data.get("allowChangeDeadline", "N")),
+                    convert_yn_to_bool(data.get("allowTimeTracking", "N")),
+                    convert_yn_to_bool(data.get("taskControl", "N")),
+                    convert_yn_to_bool(data.get("addInReport", "N")),
+                    data.get("forkedByTemplateId"), data.get("timeEstimate", "0"), data.get("timeSpentInLogs"),
+                    convert_yn_to_bool(data.get("matchWorkTime", "N")), data.get("forumTopicId"),
+                    data.get("forumId"), data.get("siteId"), convert_yn_to_bool(data.get("subordinate", "N")),
+                    data.get("exchangeModified"), data.get("exchangeId"), data.get("outlookVersion"),
+                    data.get("viewedDate"), data.get("sorting"), data.get("durationPlan"),
+                    data.get("durationFact"), data.get("durationType", "days"),
+                    convert_yn_to_bool(data.get("isMuted", "N")), convert_yn_to_bool(data.get("isPinned", "N")),
+                    convert_yn_to_bool(data.get("isPinnedInGroup", "N")), data.get("flowId"),
+                    convert_yn_to_bool(data.get("descriptionInBbcode", "N")), data.get("status", "2"),
+                    data.get("statusChangedDate"), convert_yn_to_bool(data.get("favorite", "N")),
+                    data.get("groupId", "0"), auditors, accomplices, data.get("newCommentsCount", 0),
+                    group, creator_id, responsible_id, accomplices_data, auditors_data, data.get("subStatus", "0")
                 ))
                 conn.commit()
     except Exception as e:
@@ -375,7 +362,7 @@ def init_db():
                         title TEXT NOT NULL,
                         description TEXT,
                         mark TEXT,
-                        priority INTEGER NOT NULL DEFAULT 1, 
+                        priority INTEGER NOT NULL DEFAULT 1,
                         multitask BOOLEAN NOT NULL DEFAULT FALSE,
                         not_viewed BOOLEAN NOT NULL DEFAULT FALSE,
                         replicate BOOLEAN NOT NULL DEFAULT FALSE,
@@ -385,7 +372,7 @@ def init_db():
                         responsible_id INTEGER NOT NULL DEFAULT 0,
                         changed_by INTEGER NOT NULL DEFAULT 0,
                         changed_date TIMESTAMP WITH TIME ZONE,
-                        status_changed_by INTEGER NOT NULL DEFAULT 0,
+                        status_changed_by INTEGER,
                         closed_by INTEGER,
                         closed_date TIMESTAMP WITH TIME ZONE,
                         activity_date TIMESTAMP WITH TIME ZONE,
@@ -398,7 +385,7 @@ def init_db():
                         comments_count INTEGER,
                         service_comments_count INTEGER,
                         allow_change_deadline BOOLEAN NOT NULL DEFAULT FALSE,
-                        allow_time_tracking BOOLEAN NOT NULL DEFAULT FALSE,   
+                        allow_time_tracking BOOLEAN NOT NULL DEFAULT FALSE,
                         task_control BOOLEAN NOT NULL DEFAULT FALSE,
                         add_in_report BOOLEAN NOT NULL DEFAULT FALSE,
                         forked_by_template_id INTEGER,
@@ -410,23 +397,23 @@ def init_db():
                         site_id TEXT,
                         subordinate BOOLEAN NOT NULL DEFAULT FALSE,
                         exchange_modified TIMESTAMP WITH TIME ZONE,
-                        exchange_id INTEGER,    
+                        exchange_id INTEGER,
                         outlook_version INTEGER,
                         viewed_date TIMESTAMP WITH TIME ZONE,
                         sorting DOUBLE PRECISION,
                         duration_plan INTEGER,
-                        duration_fact INTEGER,    
+                        duration_fact INTEGER,
                         duration_type TEXT NOT NULL DEFAULT 'days',
                         is_muted BOOLEAN NOT NULL DEFAULT FALSE,
                         is_pinned BOOLEAN NOT NULL DEFAULT FALSE,
-                        is_pinned_in_group BOOLEAN NOT NULL DEFAULT FALSE,    
+                        is_pinned_in_group BOOLEAN NOT NULL DEFAULT FALSE,
                         flow_id INTEGER,
                         description_in_bbcode BOOLEAN NOT NULL DEFAULT FALSE,
-                        status INTEGER NOT NULL DEFAULT 2, 
-                        status_changed_date TIMESTAMP WITH TIME ZONE, 
-                        favorite BOOLEAN NOT NULL DEFAULT FALSE,    
+                        status INTEGER NOT NULL DEFAULT 2,
+                        status_changed_date TIMESTAMP WITH TIME ZONE,
+                        favorite BOOLEAN NOT NULL DEFAULT FALSE,
                         group_id INTEGER NOT NULL DEFAULT 0,
-                        auditors JSONB NOT NULL DEFAULT '[]'::jsonb,    
+                        auditors JSONB NOT NULL DEFAULT '[]'::jsonb,
                         accomplices JSONB NOT NULL DEFAULT '[]'::jsonb,
                         new_comments_count INTEGER NOT NULL DEFAULT 0,
                         "group" JSONB NOT NULL DEFAULT '[]'::jsonb,
@@ -480,7 +467,6 @@ def init_db():
     except Exception as e:
         logger.error(f"Failed to initialize database: {e}")
 
-# Инициализация базы данных при запуске
 init_db()
 
 @app.route("/status", methods=["GET"])
@@ -508,6 +494,15 @@ def start_sync(entity):
         return jsonify({"status": "error", "message": "Sync already running"}), 400
     threading.Thread(target=sync_entity, args=(entity,), daemon=True).start()
     return jsonify({"status": "success", "message": f"Syncing {entity} started"}), 200
+
+@app.route("/stop_sync/<entity>", methods=["POST"])
+def stop_sync(entity):
+    if entity not in sync_status:
+        return jsonify({"status": "error", "message": "Invalid entity"}), 400
+    if not sync_status[entity]["running"]:
+        return jsonify({"status": "error", "message": "No sync running for this entity"}), 400
+    sync_status[entity]["stop_requested"] = True
+    return jsonify({"status": "success", "message": f"Stopping sync for {entity} requested"}), 200
 
 @app.route("/clear/<entity>", methods=["POST"])
 def clear_entity(entity):
