@@ -69,18 +69,33 @@ def get_count_from_bitrix(entity):
         if entity == "deals":
             url = f"{BITRIX_URL}crm.deal.list"
             params = {"SELECT[]": "ID"}
+            response = requests.get(url, params=params, timeout=10, verify=False)
+            response.raise_for_status()
+            data = response.json()
+            return data["total"] if "total" in data else 0
         elif entity == "tasks":
             url = f"{BITRIX_URL}tasks.task.list"
             params = {"SELECT[]": "ID"}
+            response = requests.get(url, params=params, timeout=10, verify=False)
+            response.raise_for_status()
+            data = response.json()
+            return data["total"] if "total" in data else 0
         elif entity == "projects":
             url = f"{BITRIX_URL}sonet_group.get"
             params = {"SELECT[]": "ID"}
-        response = requests.get(url, params=params, timeout=10, verify=False)
-        response.raise_for_status()
-        data = response.json()
-        if entity == "projects":
-            return len(data["result"])
-        return data["total"] if "total" in data else 0
+            total = 0
+            start = 0
+            while True:
+                response = requests.get(url, params={**params, "start": start}, timeout=10, verify=False)
+                response.raise_for_status()
+                data = response.json()
+                if "result" not in data or not data["result"]:
+                    break
+                total += len(data["result"])
+                if "next" not in data:
+                    break
+                start = data["next"]
+            return total
     except requests.RequestException as e:
         logger.error(f"Error fetching {entity} count from Bitrix: {e}")
         return 0

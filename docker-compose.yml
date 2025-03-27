@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   postgres:
     image: postgres:13
@@ -19,6 +17,8 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - app-network
 
   backend:
     build: ./backend
@@ -30,10 +30,12 @@ services:
     ports:
       - "5000:5000"
     volumes:
-      - ./backend:/app  # Монтируем код в реальном времени
+      - ./backend:/app
     depends_on:
       postgres:
         condition: service_healthy
+    networks:
+      - app-network
 
   superset:
     build: ./superset
@@ -57,6 +59,8 @@ services:
               superset init &&
               superset fab create-admin --username $$SUPERSET_USERNAME --firstname $$SUPERSET_FIRST_NAME --lastname $$SUPERSET_LAST_NAME --email admin@example.com --password $$SUPERSET_PASSWORD &&
               gunicorn --bind 0.0.0.0:8088 'superset.app:create_app()'"
+    networks:
+      - app-network
 
   web:
     build: ./web
@@ -65,12 +69,18 @@ services:
     ports:
       - "3000:3000"
     environment:
-      - CHOKIDAR_USEPOLLING=true  # Для автосборки в Docker
+      - CHOKIDAR_USEPOLLING=true
     volumes:
       - ./web:/app
       - /app/node_modules
     depends_on:
       - backend
+    networks:
+      - app-network
 
 volumes:
   pgdata:
+
+networks:
+  app-network:
+    driver: bridge
