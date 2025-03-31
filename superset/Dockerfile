@@ -21,10 +21,11 @@ RUN sed -i '/"dependencies": {/a \    "superset-plugin-chart-hello-world": "file
 RUN cd /app/superset/superset-frontend && \
     npm install --legacy-peer-deps @react-spring/web global-box currencyformatter.js
 
-# Обновляем MainPreset.js, добавляя плагин в массив plugins внутри super()
-RUN echo "import { SupersetPluginChartHelloWorld } from 'superset-plugin-chart-hello-world';" > /app/superset/superset-frontend/src/visualizations/presets/MainPreset.js.tmp && \
-    sed '/plugins: \[/a \        new SupersetPluginChartHelloWorld().configure({ key: "hello-world" }),' \
+# Обновляем MainPreset.js с одинарными кавычками
+RUN echo "import { SupersetPluginChartHelloWorld } from '../../../superset-plugin-chart-hello-world/src/index';" > /app/superset/superset-frontend/src/visualizations/presets/MainPreset.js.tmp && \
+    sed "/plugins: \[/a \        new SupersetPluginChartHelloWorld().configure({ key: 'hello-world' })," \
     /app/superset/superset-frontend/src/visualizations/presets/MainPreset.js >> /app/superset/superset-frontend/src/visualizations/presets/MainPreset.js.tmp && \
+    cp /app/superset/superset-frontend/src/visualizations/presets/MainPreset.js.tmp /home/MainPreset.js.backup && \
     mv /app/superset/superset-frontend/src/visualizations/presets/MainPreset.js.tmp /app/superset/superset-frontend/src/visualizations/presets/MainPreset.js
 
 # Отключаем правило no-unused-vars в .eslintrc.js
@@ -41,5 +42,6 @@ RUN pip install gunicorn psycopg2-binary
 USER root
 COPY superset_config.py /app/superset_config.py
 ENV SUPERSET_CONFIG_PATH=/app/superset_config.py
+COPY --from=frontend-build /home /home
 COPY --from=frontend-build /app/superset/superset-frontend/dist /app/superset-frontend/dist
 USER superset
