@@ -49,6 +49,8 @@ services:
       - SUPERSET_FIRST_NAME=${SUPERSET_FIRST_NAME}
       - SUPERSET_LAST_NAME=${SUPERSET_LAST_NAME}
       - SQLALCHEMY_DATABASE_URI=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      - DOCKER_CLIENT_TIMEOUT=50000  # Увеличиваем до 10 минут
+      - COMPOSE_HTTP_TIMEOUT=50000   # Увеличиваем до 10 минут
     ports:
       - "8088:8088"
     depends_on:

@@ -1,6 +1,6 @@
 # superset-plugin-chart-d3-tree
 
-This is the Other Superset Chart Plugin.
+This is the Tree table Superset Chart Plugin.
 
 ### Usage
 

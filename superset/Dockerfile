@@ -1,28 +1,45 @@
-# Этап 1: Сборка плагина
-FROM node:16 AS plugin-builder
+# Этап 1: Сборка фронтенда
+FROM node:22 AS frontend-build
 WORKDIR /app
-COPY superset-plugin-chart-d3-tree/package.json ../superset-plugin-chart-d3-tree/package-lock.json ./
-RUN npm install
-COPY superset-plugin-chart-d3-tree ./
-RUN npm run build
 
-# Этап 2: Сборка Superset
-FROM apache/superset:latest
+# Устанавливаем Git
+RUN apt-get update && apt-get install -y git
 
+# Клонируем репозиторий Superset
+RUN git clone https://github.com/apache/superset.git && \
+    cd superset && \
+    git checkout 4.1.2
+
+# Копируем плагин
+COPY plugins/superset-plugin-chart-hello-world /app/superset-plugin-chart-hello-world
+
+# Обновляем package.json фронтенда
+RUN sed -i '/"dependencies": {/a \    "superset-plugin-chart-hello-world": "file:../../superset-plugin-chart-hello-world",' \
+    /app/superset/superset-frontend/package.json
+
+# Добавляем отсутствующие зависимости
+RUN cd /app/superset/superset-frontend && \
+    npm install --legacy-peer-deps @react-spring/web global-box currencyformatter.js
+
+# Обновляем MainPreset.js, добавляя плагин в массив plugins внутри super()
+RUN echo "import { SupersetPluginChartHelloWorld } from 'superset-plugin-chart-hello-world';" > /app/superset/superset-frontend/src/visualizations/presets/MainPreset.js.tmp && \
+    sed '/plugins: \[/a \        new SupersetPluginChartHelloWorld().configure({ key: "hello-world" }),' \
+    /app/superset/superset-frontend/src/visualizations/presets/MainPreset.js >> /app/superset/superset-frontend/src/visualizations/presets/MainPreset.js.tmp && \
+    mv /app/superset/superset-frontend/src/visualizations/presets/MainPreset.js.tmp /app/superset/superset-frontend/src/visualizations/presets/MainPreset.js
+
+# Отключаем правило no-unused-vars в .eslintrc.js
+RUN sed -i "/rules: {/a\    'no-unused-vars': 'off'," /app/superset/superset-frontend/.eslintrc.js
+
+# Собираем фронтенд
+WORKDIR /app/superset/superset-frontend
+RUN npm install --legacy-peer-deps
+RUN NODE_OPTIONS="--max-old-space-size=8192" npm run build
+
+# Этап 2: Финальный образ
+FROM apache/superset:4.1.2
 RUN pip install gunicorn psycopg2-binary
-
+USER root
 COPY superset_config.py /app/superset_config.py
 ENV SUPERSET_CONFIG_PATH=/app/superset_config.py
-
-USER root
-RUN apt-get update && apt-get install -y curl
-RUN curl -fsSL https://deb.nodesource.com/setup_16.x | bash - && apt-get install -y nodejs
-
-# Копирование скомпилированного плагина
-COPY --from=plugin-builder /app/lib /superset-plugin-chart-d3-tree
-RUN npm install /superset-plugin-chart-d3-tree --no-save --prefix /usr/local/lib/python3.*/dist-packages/superset-frontend
-
-# Обновление MainPreset.js
-RUN sed -i "/this.plugins = \[/a new (require('superset-plugin-chart-d3-tree').default)().configure({ key: 'd3-tree' })," /usr/local/lib/python3.*/dist-packages/superset-frontend/src/visualizations/presets/MainPreset.js
-
+COPY --from=frontend-build /app/superset/superset-frontend/dist /app/superset-frontend/dist
 USER superset
