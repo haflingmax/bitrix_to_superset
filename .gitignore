@@ -1,0 +1,16 @@
+/.env
+/.venv
+*.log
+*.pyc
+metadata/
+superset/*
+!superset/
+!superset/Dockerfile
+!superset/superset_config.py
+!superset/superset-frontend/
+!superset/superset-frontend/plugins/my-plugins/
+superset/superset-frontend/plugins/my-plugins/node_modules/
+superset/*
+superset/superset-frontend/plugins/my-plugin/lib/
+superset/superset-frontend/plugins/my-plugin/esm/
+*/**/node_modules/

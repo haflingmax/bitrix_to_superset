@@ -1,0 +1,179 @@
+x-superset-image: &superset-image apachesuperset.docker.scarf.sh/apache/superset:${TAG:-latest-dev}
+x-superset-depends-on: &superset-depends-on
+  - db
+  - redis
+x-superset-volumes:
+  &superset-volumes # /app/pythonpath_docker will be appended to the PYTHONPATH in the final container
+  - ./superset/docker:/app/docker
+  - ./superset:/app/superset_home
+
+services:
+  redis:
+    image: redis:7
+    container_name: superset_cache
+    restart: unless-stopped
+    volumes:
+      - redis:/data
+    networks:
+      - app-network
+
+  db:
+    env_file:
+      - path: .env # default
+        required: true
+      - path: .env-local # optional override
+        required: false
+    image: postgres:15
+    container_name: superset_db
+    restart: unless-stopped
+    volumes:
+      - db_home:/var/lib/postgresql/data
+      - ./superset/docker/docker-entrypoint-initdb.d:/docker-entrypoint-initdb.d
+    networks:
+      - app-network
+
+  superset:
+    env_file:
+      - path: .env # default
+        required: true
+      - path: .env-local # optional override
+        required: false
+    build: ./superset/
+    image: superset_app_castom
+    container_name: superset_app
+    command: ["/app/docker/docker-bootstrap.sh", "app-gunicorn"]
+    user: "root"
+    restart: unless-stopped
+    ports:
+      - 8088:8088
+    depends_on: *superset-depends-on
+    volumes: *superset-volumes
+    networks:
+      - app-network
+
+  superset-init:
+    image: *superset-image
+    container_name: superset_init
+    command: ["/app/docker/docker-init.sh"]
+    env_file:
+      - path: .env # default
+        required: true
+      - path: .env-local # optional override
+        required: false
+    depends_on: *superset-depends-on
+    user: "root"
+    volumes: *superset-volumes
+    healthcheck:
+      disable: true
+    networks:
+      - app-network
+
+  superset-worker:
+    image: *superset-image
+    container_name: superset_worker
+    command: ["/app/docker/docker-bootstrap.sh", "worker"]
+    env_file:
+      - path: .env # default
+        required: true
+      - path: .env-local # optional override
+        required: false
+    restart: unless-stopped
+    depends_on: *superset-depends-on
+    user: "root"
+    volumes: *superset-volumes
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "celery -A superset.tasks.celery_app:app inspect ping -d celery@$$HOSTNAME",
+        ]
+    networks:
+      - app-network
+
+  superset-worker-beat:
+    image: *superset-image
+    container_name: superset_worker_beat
+    command: ["/app/docker/docker-bootstrap.sh", "beat"]
+    env_file:
+      - path: .env # default
+        required: true
+      - path: .env-local # optional override
+        required: false
+    restart: unless-stopped
+    depends_on: *superset-depends-on
+    user: "root"
+    volumes: *superset-volumes
+    healthcheck:
+      disable: true
+    networks:
+      - app-network
+
+  postgres:
+    image: postgres:13
+    container_name: postgres_db
+    restart: always
+    environment:
+      POSTGRES_USER: ${SUPERSET_DB_USER}  # superset_user
+      POSTGRES_PASSWORD: ${SUPERSET_DB_PASSWORD}  # superset_pass
+      POSTGRES_DB: ${SUPERSET_DB_NAME}  # superset_db
+    volumes:
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - 5432:5432
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${SUPERSET_DB_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - app-network
+
+  backend:
+    build: ./backend
+    container_name: bitrix_webhook
+    restart: always
+    environment:
+      - DATABASE_URL=postgresql://${SUPERSET_DB_USER}:${SUPERSET_DB_PASSWORD}@postgres:5432/${SUPERSET_DB_NAME}
+      - BITRIX_URL=${BITRIX_URL}
+      - BACKEND_PORT=${BACKEND_PORT}
+    ports:
+      - ${BACKEND_PORT}:5000
+    volumes:
+      - ./backend:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - app-network
+
+  web:
+    build: ./web
+    container_name: web
+    restart: on-failure
+    ports:
+      - ${REACT_APP_PORT}:3000
+    environment:
+      - CHOKIDAR_USEPOLLING=true
+      - BACKEND_PORT=${BACKEND_PORT}
+    volumes:
+      - ./web:/app
+      - /app/node_modules
+    depends_on:
+      - backend
+    networks:
+      - app-network
+
+
+networks:
+  app-network:
+    driver: bridge
+
+volumes:
+  pgdata:
+  superset_home:
+    external: false
+  db_home:
+    external: false
+  redis:
+    external: false

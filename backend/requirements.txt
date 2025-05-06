@@ -1,0 +1,8 @@
+Flask==2.3.3
+requests==2.31.0
+psycopg2-binary==2.9.9
+flask-cors==4.0.0
+gunicorn==20.1.0
+tenacity 
+flask-socketio 
+python-dotenv

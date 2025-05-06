@@ -1,0 +1,88 @@
+services:
+  postgres:
+    image: postgres:13
+    container_name: postgres_db
+    restart: always
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}  # superset_user
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}  # superset_pass
+      POSTGRES_DB: ${POSTGRES_DB}  # superset_db
+    volumes:
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - app-network
+
+  backend:
+    build: ./backend
+    container_name: bitrix_webhook
+    restart: always
+    environment:
+      - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      - BITRIX_URL=${BITRIX_URL}
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./backend:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - app-network
+
+  superset:
+    build: ./superset
+    container_name: superset
+    restart: always
+    environment:
+      - SUPERSET_LOAD_EXAMPLES=no
+      - SUPERSET_SECRET_KEY=${SUPERSET_SECRET_KEY}
+      - SUPERSET_USERNAME=${SUPERSET_USERNAME}
+      - SUPERSET_PASSWORD=${SUPERSET_PASSWORD}
+      - SUPERSET_FIRST_NAME=${SUPERSET_FIRST_NAME}
+      - SUPERSET_LAST_NAME=${SUPERSET_LAST_NAME}
+      - SQLALCHEMY_DATABASE_URI=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      - DOCKER_CLIENT_TIMEOUT=50000  # Увеличиваем до 10 минут
+      - COMPOSE_HTTP_TIMEOUT=50000   # Увеличиваем до 10 минут
+    ports:
+      - "8088:8088"
+    depends_on:
+      - postgres
+    command: >
+      bash -c "echo 'SQLALCHEMY_DATABASE_URI: $$SQLALCHEMY_DATABASE_URI' &&
+              superset db upgrade &&
+              superset init &&
+              superset fab create-admin --username $$SUPERSET_USERNAME --firstname $$SUPERSET_FIRST_NAME --lastname $$SUPERSET_LAST_NAME --email admin@example.com --password $$SUPERSET_PASSWORD &&
+              gunicorn --bind 0.0.0.0:8088 'superset.app:create_app()'"
+    networks:
+      - app-network
+
+  web:
+    build: ./web
+    container_name: web
+    restart: on-failure
+    ports:
+      - "3000:3000"
+    environment:
+      - CHOKIDAR_USEPOLLING=true
+    volumes:
+      - ./web:/app
+      - /app/node_modules
+    depends_on:
+      - backend
+    networks:
+      - app-network
+
+volumes:
+  pgdata:
+
+networks:
+  app-network:
+    driver: bridge
